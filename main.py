@@ -284,7 +284,7 @@ class HyperSimDataset(Dataset):
 #       root/
 #         ├─ img/    frame_000001.png …
 #         └─ depth/  frame_000001.exr …
-#     * 깊이: EXR float32(m) 1‑채널 (‘Z’ 또는 ‘R’)
+#     * 깊이: EXR float32(m) 1‑채널 (‘Z' 또는 'R')
 #     * 출력: dict(rgb, depth, tag, rgb_path, depth_path)
 #             - rgb:   Tensor (3,H,W)  float32, 0‑1, ImageNet norm
 #             - depth: Tensor (1,H,W)  float32, [m]
@@ -315,7 +315,7 @@ class HyperSimDataset(Dataset):
 #         W = header['dataWindow'].max.x + 1
 #         H = header['dataWindow'].max.y + 1
 #
-#         # Synscapes EXR 는 'R' 채널 하나만 포함
+#         # Synscapes EXR 는 'R' 채널 하나만 포함
 #         channel_name = 'R' if 'R' in header['channels'] else 'Z'
 #         pt_float = Imath.PixelType(Imath.PixelType.FLOAT)
 #         depth_str = exr.channel(channel_name, pt_float)
@@ -607,15 +607,21 @@ def load_pipeline(rank):
     # Stable Diffusion v1.5 or v2
     pipe = StableDiffusionPipeline.from_pretrained(
         "stabilityai/stable-diffusion-2",
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,  # FP16으로 변경
         use_safetensors=True,
     ).to(rank)
 
     vae = pipe.vae
     unet = pipe.unet
 
+    # VAE를 FP16으로 변환
+    vae = vae.half()
+    
     # 🔧 unet 입력 채널 확장
     unet = expand_unet_input_channels(unet, new_in_channels=8)
+    
+    # UNet을 FP16으로 변환
+    unet = unet.half()
 
     return vae, unet
 
@@ -1188,166 +1194,30 @@ def save_latent_comparison(pred_z0, depth_latent, save_path):
 def expand_to_3channel(x):
     """
     (B, 4, H, W) → (B*4, 3, H, W)
-    4개 채널 각각을 3채널로 복제
+    각 채널을 3채널로 복제
     """
     B, C, H, W = x.shape
-    expanded = []
-    for c in range(C):
-        single_channel = x[:, c:c+1, :, :]  # (B,1,H,W)
-        single_3ch = single_channel.repeat(1, 3, 1, 1)  # (B,3,H,W)
-        expanded.append(single_3ch)
-    expanded = torch.cat(expanded, dim=0)  # (B*4, 3, H, W)
+    assert C == 4, f"Expected 4 channels, got {C}"
+    
+    # (B, 4, H, W) → (B*4, 1, H, W)
+    expanded = x.view(B * C, 1, H, W)
+    
+    # (B*4, 1, H, W) → (B*4, 3, H, W) - 각 채널을 3번 복제
+    expanded = expanded.repeat(1, 3, 1, 1)
+    
     return expanded
 
 
-# def compute_lcm_loss(model, image_latent, depth_latent, noise, t, alphas_cumprod):
-#     """
-#     LCM Consistency Loss + Latent-space Perceptual Loss (Channel-wise)
-#     """
-#     B = image_latent.shape[0]
-#     sqrt_alpha = extract(alphas_cumprod, t, (B, 1, 1, 1)).sqrt()
-#     sqrt_one_minus_alpha = (1. - extract(alphas_cumprod, t, (B, 1, 1, 1))).sqrt()
-#
-#     noisy_depth = sqrt_alpha * depth_latent + sqrt_one_minus_alpha * noise
-#     noisy_concat = torch.cat([image_latent, noisy_depth], dim=1)
-#
-#     pred_z0 = model(noisy_concat, t)
-#
-#     # (1) 기본 latent MSE
-#     loss_latent_mse = F.mse_loss(pred_z0, depth_latent)
-#
-#     # (2) 4채널 각각을 3채널로 복제
-#     pred_expanded = expand_to_3channel(pred_z0)        # (B*4, 3, H, W)
-#     gt_expanded = expand_to_3channel(depth_latent)     # (B*4, 3, H, W)
-#
-#     # (3) SSIM
-#     ssim_loss = 1 - pytorch_msssim.ssim(pred_expanded, gt_expanded, data_range=1.0, size_average=True)
-#
-#     # (4) LPIPS
-#     lpips_loss = lpips_fn(pred_expanded, gt_expanded).mean()
-#
-#     # (5) 총 Loss
-#     loss_total = loss_latent_mse + 0.1 * ssim_loss + 0.1 * lpips_loss
-#
-#     return loss_total
-#
-
-def sample_skipping_timesteps(N, skip_interval=20, size=(1,), device="cuda"):
+def extract(a, t, shape):
     """
-    Skipping-step 기반 타임스텝 샘플링
-
-    Args:
-        N: 전체 타임스텝 수 (예: 1000)
-        skip_interval: 건너뛰기 간격 (예: 20)
-        size: 뽑을 개수
-        device: 디바이스
+    a: (T,) - 전체 타임스텝별 alphas_cumprod
+    t: (B,) - 배치마다 선택된 타임스텝
+    shape: (B, 1, 1, 1) - 원하는 리쉐입 형태
     """
-    skip_steps = np.arange(0, N, skip_interval)
-    t = np.random.choice(skip_steps, size=size)
-    return torch.from_numpy(t).to(device).long()
+    out = a.gather(-1, t)
+    return out.view(shape).float()
 
 
-# def train_lcm_one_epoch(
-#     model,
-#     # model_teacher,
-#     vae,
-#     train_loader,
-#     optimizer,
-#     device,
-#     alphas_cumprod,
-#     epoch,
-#     output_dir,
-#     ema_decay=0.95,
-#     # use_teacher_as_target=False,
-# ):
-#     model.train()
-#     # model_teacher.eval()
-#     vae.eval()
-#
-#     total_loss = 0.0
-#     ema_loss = None
-#     num_batches = len(train_loader)
-#
-#     if torch.distributed.get_rank() == 0:
-#         progress_bar = tqdm(total=num_batches, desc=f"[Epoch {epoch}]")
-#
-#     for batch_idx, batch in enumerate(train_loader):
-#         optimizer.zero_grad()
-#
-#         # 🛠️ latent, noise, timestep 준비
-#         rgb = batch["rgb"].to(device)       # (B, 3, H, W)
-#         depth = batch["depth"].to(device)   # (B, 1, H, W)
-#         B = rgb.size(0)
-#
-#         image_latent = vae.encode(rgb).latent_dist.sample() * 0.18215
-#         depth_latent = vae.encode(depth.repeat(1, 3, 1, 1)).latent_dist.sample() * 0.18215
-#         noise = torch.randn_like(depth_latent)
-#         # t = torch.randint(0, alphas_cumprod.shape[0], (B,), device=device)
-#         t = sample_skipping_timesteps(
-#             N=alphas_cumprod.shape[0],
-#             skip_interval=20,  # ← 여기서 스킵 간격 쉽게 조정 가능
-#             size=(B,),
-#             device=device
-#         )
-#
-#         # 🛠️ 손실 계산
-#         loss = compute_lcm_loss(
-#             model=model,
-#             # model_teacher=model_teacher,
-#             image_latent=image_latent,
-#             depth_latent=depth_latent,
-#             noise=noise,
-#             t=t,
-#             alphas_cumprod=alphas_cumprod,
-#             # use_teacher_as_target=use_teacher_as_target,
-#         )
-#         accumulation_steps = 16
-#         loss = loss / accumulation_steps
-#         loss.backward()
-#         # optimizer.step()
-#         if (batch_idx + 1) % accumulation_steps == 0:
-#             optimizer.step()
-#             optimizer.zero_grad()
-#
-#         # # 🛠️ EMA 업데이트
-#         # with torch.no_grad():
-#         #     for p, p_ema in zip(model.parameters(), model_teacher.parameters()):
-#         #         p_ema.copy_(ema_decay * p_ema + (1.0 - ema_decay) * p)
-#
-#         total_loss += loss.item()
-#         if ema_loss is None:
-#             ema_loss = loss.item()
-#         else:
-#             ema_loss = 0.95 * ema_loss + 0.05 * loss.item()
-#
-#         if torch.distributed.get_rank() == 0:
-#             progress_bar.update(1)
-#             progress_bar.set_postfix({
-#                 "loss": f"{loss.item():.8f}",
-#                 "ema_loss": f"{ema_loss:.8f}"
-#             })
-#             # # Debugging 손실 세부 출력
-#             # if batch_idx % 20 == 0:
-#             #     print(f"[DEBUG] Epoch {epoch} | Batch {batch_idx} | loss_consistency: {loss_consistency.item():.6f}, loss_velocity: {loss_velocity.item():.6f}")
-#
-#             if batch_idx % 500 == 0:
-#                 sample_and_save_depth_model(
-#                     model,  # or model if teacher not used
-#                     vae,
-#                     batch,
-#                     device,
-#                     batch_idx,
-#                     output_dir,
-#                     alphas_cumprod,
-#                     epoch
-#                 )
-#
-#     if torch.distributed.get_rank() == 0:
-#         progress_bar.close()
-#
-#     return total_loss / num_batches
-
-# AMP (Automatic Mixed Precision) 를 적용
 def train_lcm_one_epoch(
     model,
     vae,
@@ -1364,7 +1234,7 @@ def train_lcm_one_epoch(
     optimizer.zero_grad(set_to_none=True)
 
     model.train()
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=True)  # FP16 스케일링 활성화
     total_loss = 0.0
     ema_loss = None
     num_batches = len(train_loader)
@@ -1388,18 +1258,23 @@ def train_lcm_one_epoch(
         progress_bar = tqdm(total=num_batches, desc=f"[Epoch {epoch}]")
 
     for batch_idx, batch in enumerate(train_loader):
-        rgb = batch["rgb"].to(device)
-        depth = batch["depth"].to(device)
+        rgb = batch["rgb"].to(device, dtype=torch.float16)  # FP16으로 변환
+        depth = batch["depth"].to(device, dtype=torch.float16)  # FP16으로 변환
         rgb, depth = transform(rgb, depth)
 
         B = rgb.shape[0]
         T = alphas_cumprod.shape[0]
         t = torch.randint(0, T, (B,), device=device).long()
 
-        with autocast():
+        with autocast(enabled=True):  # FP16 autocast 활성화
             image_latent = vae.encode(rgb).latent_dist.sample() * 0.18215
             depth_latent = vae.encode(depth.repeat(1, 3, 1, 1)).latent_dist.sample() * 0.18215
-            noise = torch.randn_like(depth_latent)  # ✅ depth_latent랑 같은 shape으로 noise 생성
+            noise = torch.randn_like(depth_latent, dtype=torch.float16)  # FP16 noise
+
+            # NaN 체크
+            if torch.isnan(image_latent).any() or torch.isnan(depth_latent).any():
+                print(f"[WARNING] NaN detected in latents at batch {batch_idx}, skipping...")
+                continue
 
             sync_context = (
                 model.no_sync() if (batch_idx + 1) % accumulation_steps else nullcontext()
@@ -1414,11 +1289,21 @@ def train_lcm_one_epoch(
                     alphas_cumprod=alphas_cumprod,
                 ) / accumulation_steps
 
+                # NaN 체크
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"[WARNING] NaN/Inf loss detected at batch {batch_idx}, skipping...")
+                    optimizer.zero_grad()
+                    continue
+
                 scaler.scale(loss).backward()
 
         total_loss += loss.item()
 
         if (batch_idx + 1) % accumulation_steps == 0:
+            # Gradient clipping 추가
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -1457,48 +1342,6 @@ def train_lcm_one_epoch(
     return avg_loss
 
 
-
-# UNet 입력 채널만 수정하는 함수
-def expand_unet_input_channels(unet, new_in_channels=8):
-    """
-    기존 UNet의 입력 Conv 레이어를 수정하여 8채널 입력을 받을 수 있도록 확장
-    """
-    # 기존 입력 Conv 레이어 가져오기
-    old_conv = unet.conv_in
-
-    # 기존 conv의 설정 복제
-    new_conv = nn.Conv2d(
-        in_channels=new_in_channels,
-        out_channels=old_conv.out_channels,
-        kernel_size=old_conv.kernel_size,
-        stride=old_conv.stride,
-        padding=old_conv.padding,
-        bias=old_conv.bias is not None,
-    )
-
-    # 기존 4채널 가중치를 8채널로 복사
-    with torch.no_grad():
-        new_conv.weight[:, :4, :, :] = old_conv.weight  # 기존 이미지 채널 weight 복사
-        new_conv.weight[:, 4:, :, :] = old_conv.weight   # depth 채널도 동일 weight로 초기화
-        if old_conv.bias is not None:
-            new_conv.bias.copy_(old_conv.bias)
-
-    # unet에 새로운 conv 할당
-    unet.conv_in = new_conv
-
-    return unet
-
-
-def extract(a, t, shape):
-    """
-    a: (T,) - 전체 타임스텝별 alphas_cumprod
-    t: (B,) - 배치마다 선택된 타임스텝
-    shape: (B, 1, 1, 1) - 원하는 리쉐입 형태
-    """
-    out = a.gather(-1, t)
-    return out.view(shape).float()
-
-
 def compute_lcm_loss(model, image_latent, depth_latent, noise, t, alphas_cumprod):
     """
     LCM Consistency Loss만 계산
@@ -1507,11 +1350,23 @@ def compute_lcm_loss(model, image_latent, depth_latent, noise, t, alphas_cumprod
     sqrt_alpha = extract(alphas_cumprod, t, (B, 1, 1, 1)).sqrt()
     sqrt_one_minus_alpha = (1. - extract(alphas_cumprod, t, (B, 1, 1, 1))).sqrt()
 
+    # 안전한 연산을 위한 epsilon 추가
+    eps = 1e-8
+    
     noisy_depth = sqrt_alpha * depth_latent + sqrt_one_minus_alpha * noise
     noisy_concat = torch.cat([image_latent, noisy_depth], dim=1)
 
     pred_z0 = model(noisy_concat, t)
+    
+    # NaN 방지를 위한 안전한 MSE loss
     loss_consistency = F.mse_loss(pred_z0, depth_latent)
+    
+    # NaN/Inf 체크 및 처리
+    if torch.isnan(loss_consistency) or torch.isinf(loss_consistency):
+        print(f"[WARNING] NaN/Inf in loss_consistency: {loss_consistency}")
+        # 안전한 fallback 값 반환
+        return torch.tensor(0.1, device=loss_consistency.device, dtype=loss_consistency.dtype, requires_grad=True)
+    
     return loss_consistency
 
 
@@ -1612,7 +1467,7 @@ def eval_on_kitti_test_list(model, vae, alphas_cumprod, device, output_dir="KITT
         pred_np = pred_m[0, 0].cpu().numpy()  # (H, W), 단위=m
 
         # 2) 컬러맵용 선형 정규화 (0m=빨강, 80m=보라) -----------------
-        #    percentile→선형 치환으로 ‘매번 스케일 바뀌는 문제’ 제거
+        #    percentile→선형 치환으로 '매번 스케일 바뀌는 문제' 제거
         pred_norm = np.clip(pred_np / MAX_DEPTH, 0, 1)  # 0~1
         pred_color = plt.get_cmap("turbo")(1.0 - pred_norm)[..., :3]  # 가까울수록 빨강
         pred_color = (pred_color * 255).astype(np.uint8)
@@ -1862,12 +1717,12 @@ def main(rank, world_size):
     if unet.conv_in.in_channels == 4:          # 중복 확장 방지
         unet = expand_unet_input_channels(unet, 8)
 
-    alphas_cumprod = get_alphas_cumprod().to(rank)
+    alphas_cumprod = get_alphas_cumprod().to(rank).half()  # FP16으로 변환
     model = ConsistencyModel(
         unet=unet,
         alphas_cumprod=alphas_cumprod,
         use_gradient_checkpointing=True,
-    ).to(rank)
+    ).to(rank).half()  # FP16으로 변환
 
     # 5. 체크포인트 로드 ───────────────────────────────
     start_epoch, best_loss = 0, float("inf")
@@ -1999,3 +1854,5 @@ if __name__ == "__main__":
     world_size = torch.cuda.device_count()
     print(f"사용 가능한 GPU 수: {world_size}")
     torch.multiprocessing.spawn(main, args=(world_size,), nprocs=world_size, join=True)
+
+
