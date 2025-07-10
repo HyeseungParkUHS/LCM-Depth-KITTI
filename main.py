@@ -33,6 +33,7 @@ from contextlib import nullcontext
 # import OpenEXR, Imath
 from torchvision import transforms
 from glob import glob
+import warnings
 
 # 기본 설정
 width = 320
@@ -41,6 +42,32 @@ height = 320
 # GPU 메모리 최적화 설정
 torch.backends.cudnn.benchmark = True
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
+
+# FP16 및 수치적 안정성 설정
+def check_for_nan_inf(tensor, name="tensor"):
+    """텐서에서 NaN 또는 Inf 값을 검사합니다."""
+    if torch.isnan(tensor).any():
+        warnings.warn(f"NaN detected in {name}")
+        return True
+    if torch.isinf(tensor).any():
+        warnings.warn(f"Inf detected in {name}")
+        return True
+    return False
+
+def safe_normalize(tensor, dim=-1, eps=1e-8):
+    """안전한 L2 정규화 (NaN 방지)."""
+    norm = torch.norm(tensor, p=2, dim=dim, keepdim=True)
+    norm = torch.clamp(norm, min=eps)
+    return tensor / norm
+
+def clamp_tensor_for_stability(tensor, min_val=-65504, max_val=65504):
+    """FP16 범위 내로 텐서를 클램핑합니다."""
+    return torch.clamp(tensor, min=min_val, max=max_val)
+
+def scale_gradients_if_needed(parameters, max_norm=1.0):
+    """그래디언트가 너무 클 경우 스케일링합니다."""
+    total_norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+    return total_norm
 
 def huggingface_login(token):
     """Hugging Face 로그인"""
@@ -662,6 +689,7 @@ def prepare_dataloader(rank, world_size, width, height):
 def normalize_depth(depth: torch.Tensor) -> torch.Tensor:
     """
     Normalize a depth map tensor to the range [-1, 1] using valid (non-zero) values.
+    FP16-safe version with NaN prevention.
 
     Args:
         depth (torch.Tensor): [B, 1, H, W] tensor
@@ -671,13 +699,16 @@ def normalize_depth(depth: torch.Tensor) -> torch.Tensor:
     """
     B, _, H, W = depth.shape
     depth_flat = depth.view(B, -1)
+    
+    # FP16 안전한 epsilon 사용
+    eps = 1e-4 if depth.dtype == torch.float16 else 1e-6
 
     # 유효한 값만 마스킹
     valid_mask = depth_flat > 0
 
     # 배치별 d_min, d_max 계산 (유효값 기준)
-    d_min = torch.full((B, 1), float('inf'), device=depth.device)
-    d_max = torch.full((B, 1), float('-inf'), device=depth.device)
+    d_min = torch.full((B, 1), float('inf'), device=depth.device, dtype=depth.dtype)
+    d_max = torch.full((B, 1), float('-inf'), device=depth.device, dtype=depth.dtype)
 
     for b in range(B):
         valid = depth_flat[b][valid_mask[b]]
@@ -692,10 +723,21 @@ def normalize_depth(depth: torch.Tensor) -> torch.Tensor:
     d_min = d_min.view(B, 1, 1, 1)
     d_max = d_max.view(B, 1, 1, 1)
 
-    # 정규화: [-1, 1]로 스케일링
-    normalized = (depth - d_min) / (d_max - d_min + 1e-6)
-    normalized = normalized * 2 - 1
-    return normalized.clamp(-1, 1)
+    # 정규화: [-1, 1]로 스케일링 (NaN 방지)
+    depth_range = d_max - d_min + eps
+    normalized = (depth - d_min) / depth_range
+    normalized = normalized * 2.0 - 1.0
+    
+    # FP16 범위로 클램핑 및 NaN 체크
+    normalized = clamp_tensor_for_stability(normalized, min_val=-1.0, max_val=1.0)
+    
+    # NaN 검사 및 처리
+    nan_mask = torch.isnan(normalized)
+    if nan_mask.any():
+        warnings.warn("NaN detected in normalize_depth, replacing with -1.0")
+        normalized[nan_mask] = -1.0
+    
+    return normalized
 
 
 def prepare_dataloader_hypersim(rank, world_size, width, height):
@@ -1056,10 +1098,11 @@ def sample_and_save_depth_model(model, vae, batch, device, batch_idx, output_dir
     noisy_depth_latent = sqrt_alpha * depth_latent + sqrt_one_minus_alpha * noise
     noisy_latent = torch.cat([image_latent, noisy_depth_latent], dim=1)
 
-    # ✨ 4-step inference
+    # ✨ 4-step inference (autocast로 FP16 안전성 확보)
     for ratio in [1.0, 0.66, 0.33, 0.0]:
         t_scaled = (t.float() * ratio).round().long()
-        pred_z0 = model(noisy_latent, t_scaled)
+        with torch.cuda.amp.autocast():
+            pred_z0 = model(noisy_latent, t_scaled)
         noisy_latent[:, 4:] = pred_z0
 
     pred_depth_latent = noisy_latent[:, 4:]  # (B, 4, H, W)
@@ -1347,7 +1390,7 @@ def sample_skipping_timesteps(N, skip_interval=20, size=(1,), device="cuda"):
 #
 #     return total_loss / num_batches
 
-# AMP (Automatic Mixed Precision) 를 적용
+# FP16-safe AMP (Automatic Mixed Precision) 
 def train_lcm_one_epoch(
     model,
     vae,
@@ -1364,10 +1407,19 @@ def train_lcm_one_epoch(
     optimizer.zero_grad(set_to_none=True)
 
     model.train()
-    scaler = GradScaler()
+    # FP16 안전한 GradScaler 설정
+    scaler = GradScaler(
+        init_scale=2.**10,  # 더 작은 초기 스케일
+        growth_factor=2.0,
+        backoff_factor=0.5,
+        growth_interval=100  # 더 보수적인 스케일링
+    )
+    
     total_loss = 0.0
     ema_loss = None
     num_batches = len(train_loader)
+    nan_count = 0  # NaN 발생 횟수 추적
+    
     transform = RGBDTransform(
         output_size=(320, 320),
         crop_size=(288, 288),
@@ -1388,70 +1440,128 @@ def train_lcm_one_epoch(
         progress_bar = tqdm(total=num_batches, desc=f"[Epoch {epoch}]")
 
     for batch_idx, batch in enumerate(train_loader):
-        rgb = batch["rgb"].to(device)
-        depth = batch["depth"].to(device)
-        rgb, depth = transform(rgb, depth)
+        try:
+            rgb = batch["rgb"].to(device, non_blocking=True)
+            depth = batch["depth"].to(device, non_blocking=True)
+            
+            # 입력 텐서 NaN 검사
+            if check_for_nan_inf(rgb, "input_rgb") or check_for_nan_inf(depth, "input_depth"):
+                warnings.warn(f"Skipping batch {batch_idx} due to NaN in input")
+                continue
+                
+            rgb, depth = transform(rgb, depth)
 
-        B = rgb.shape[0]
-        T = alphas_cumprod.shape[0]
-        t = torch.randint(0, T, (B,), device=device).long()
+            B = rgb.shape[0]
+            T = alphas_cumprod.shape[0]
+            t = torch.randint(0, T, (B,), device=device).long()
 
-        with autocast():
-            image_latent = vae.encode(rgb).latent_dist.sample() * 0.18215
-            depth_latent = vae.encode(depth.repeat(1, 3, 1, 1)).latent_dist.sample() * 0.18215
-            noise = torch.randn_like(depth_latent)  # ✅ depth_latent랑 같은 shape으로 noise 생성
+            with autocast():
+                # VAE 인코딩
+                image_latent = vae.encode(rgb).latent_dist.sample() * 0.18215
+                depth_latent = vae.encode(depth.repeat(1, 3, 1, 1)).latent_dist.sample() * 0.18215
+                
+                # 텐서 클램핑으로 안정성 확보
+                image_latent = clamp_tensor_for_stability(image_latent)
+                depth_latent = clamp_tensor_for_stability(depth_latent)
+                
+                # latent NaN 검사
+                if check_for_nan_inf(image_latent, "image_latent") or check_for_nan_inf(depth_latent, "depth_latent"):
+                    warnings.warn(f"Skipping batch {batch_idx} due to NaN in latents")
+                    continue
+                
+                noise = torch.randn_like(depth_latent)
 
-            sync_context = (
-                model.no_sync() if (batch_idx + 1) % accumulation_steps else nullcontext()
-            )
-            with sync_context:
-                loss = compute_lcm_loss(
-                    model=model,
-                    image_latent=image_latent,
-                    depth_latent=depth_latent,
-                    noise=noise,
-                    t=t,
-                    alphas_cumprod=alphas_cumprod,
-                ) / accumulation_steps
-
-                scaler.scale(loss).backward()
-
-        total_loss += loss.item()
-
-        if (batch_idx + 1) % accumulation_steps == 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-        # EMA loss 업데이트
-        if ema_loss is None:
-            ema_loss = loss.item() * accumulation_steps
-        else:
-            ema_loss = 0.95 * ema_loss + 0.05 * (loss.item() * accumulation_steps)
-
-        # Progress Bar 업데이트
-        if dist.get_rank() == 0:
-            progress_bar.update(1)
-            progress_bar.set_postfix({
-                "loss": f"{loss.item() * accumulation_steps:.8f}",
-                "ema_loss": f"{ema_loss:.8f}"
-            })
-
-            if batch_idx % save_interval == 0:
-                sample_and_save_depth_model(
-                    model=model,
-                    vae=vae,
-                    batch=batch,
-                    device=device,
-                    batch_idx=batch_idx,
-                    output_dir=output_dir,
-                    alphas_cumprod=alphas_cumprod,
-                    epoch=epoch,
-                    num_inference_steps=4,
+                sync_context = (
+                    model.no_sync() if (batch_idx + 1) % accumulation_steps else nullcontext()
                 )
+                with sync_context:
+                    loss = compute_lcm_loss(
+                        model=model,
+                        image_latent=image_latent,
+                        depth_latent=depth_latent,
+                        noise=noise,
+                        t=t,
+                        alphas_cumprod=alphas_cumprod,
+                    ) / accumulation_steps
+                    
+                    # Loss NaN 검사
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        nan_count += 1
+                        warnings.warn(f"NaN/Inf loss detected at batch {batch_idx}, skipping")
+                        if nan_count > 10:  # 너무 많은 NaN이 발생하면 중단
+                            raise RuntimeError("Too many NaN losses detected")
+                        continue
+
+                    # FP16 안전한 역전파
+                    scaled_loss = scaler.scale(loss)
+                    scaled_loss.backward()
+
+            total_loss += loss.item()
+
+            # 그래디언트 업데이트
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # 그래디언트 클리핑으로 안정성 확보
+                scaler.unscale_(optimizer)
+                grad_norm = scale_gradients_if_needed(model.parameters(), max_norm=1.0)
+                
+                # 그래디언트 NaN 검사
+                valid_gradients = True
+                for param in model.parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            valid_gradients = False
+                            break
+                
+                if valid_gradients:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    warnings.warn(f"Invalid gradients at batch {batch_idx}, skipping step")
+                    scaler.update()
+                    
+                optimizer.zero_grad(set_to_none=True)
+
+            # EMA loss 업데이트
+            if ema_loss is None:
+                ema_loss = loss.item() * accumulation_steps
+            else:
+                ema_loss = 0.95 * ema_loss + 0.05 * (loss.item() * accumulation_steps)
+
+            # Progress Bar 업데이트
+            if dist.get_rank() == 0:
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "loss": f"{loss.item() * accumulation_steps:.8f}",
+                    "ema_loss": f"{ema_loss:.8f}",
+                    "nan_count": nan_count,
+                    "scale": f"{scaler.get_scale():.0f}"
+                })
+
+                if batch_idx % save_interval == 0:
+                    sample_and_save_depth_model(
+                        model=model,
+                        vae=vae,
+                        batch=batch,
+                        device=device,
+                        batch_idx=batch_idx,
+                        output_dir=output_dir,
+                        alphas_cumprod=alphas_cumprod,
+                        epoch=epoch,
+                        num_inference_steps=4,
+                    )
+                    
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                warnings.warn(f"OOM at batch {batch_idx}, clearing cache")
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
 
     if torch.distributed.get_rank() == 0:
         progress_bar.close()
+        if nan_count > 0:
+            print(f"Warning: {nan_count} NaN occurrences during training")
 
     avg_loss = (total_loss * accumulation_steps) / len(train_loader)
     return avg_loss
@@ -1501,17 +1611,42 @@ def extract(a, t, shape):
 
 def compute_lcm_loss(model, image_latent, depth_latent, noise, t, alphas_cumprod):
     """
-    LCM Consistency Loss만 계산
+    LCM Consistency Loss 계산 (FP16 안전 버전)
     """
     B = image_latent.shape[0]
+    
+    # FP16 안전한 epsilon
+    eps = 1e-4 if image_latent.dtype == torch.float16 else 1e-8
+    
     sqrt_alpha = extract(alphas_cumprod, t, (B, 1, 1, 1)).sqrt()
-    sqrt_one_minus_alpha = (1. - extract(alphas_cumprod, t, (B, 1, 1, 1))).sqrt()
+    sqrt_one_minus_alpha = (1. - extract(alphas_cumprod, t, (B, 1, 1, 1)) + eps).sqrt()
+
+    # 수치적 안정성을 위한 클램핑
+    sqrt_alpha = clamp_tensor_for_stability(sqrt_alpha)
+    sqrt_one_minus_alpha = clamp_tensor_for_stability(sqrt_one_minus_alpha)
 
     noisy_depth = sqrt_alpha * depth_latent + sqrt_one_minus_alpha * noise
+    noisy_depth = clamp_tensor_for_stability(noisy_depth)
+    
     noisy_concat = torch.cat([image_latent, noisy_depth], dim=1)
-
-    pred_z0 = model(noisy_concat, t)
-    loss_consistency = F.mse_loss(pred_z0, depth_latent)
+    
+    # autocast 내에서 forward pass
+    with autocast():
+        pred_z0 = model(noisy_concat, t)
+        pred_z0 = clamp_tensor_for_stability(pred_z0)
+        
+        # NaN 검사
+        if check_for_nan_inf(pred_z0, "pred_z0"):
+            # NaN이 발견되면 작은 값으로 대체
+            pred_z0 = torch.where(torch.isnan(pred_z0), torch.zeros_like(pred_z0), pred_z0)
+            pred_z0 = torch.where(torch.isinf(pred_z0), torch.zeros_like(pred_z0), pred_z0)
+        
+        # Huber loss 사용 (MSE보다 더 안정적)
+        loss_consistency = F.smooth_l1_loss(pred_z0, depth_latent, reduction='mean')
+        
+        # Loss 클램핑
+        loss_consistency = torch.clamp(loss_consistency, min=0.0, max=100.0)
+    
     return loss_consistency
 
 
@@ -1592,7 +1727,8 @@ def eval_on_kitti_test_list(model, vae, alphas_cumprod, device, output_dir="KITT
         # === Multi-step denoising (4-step) ===
         for ratio in [1.0, 0.66, 0.33, 0.0]:
             t_scaled = (t.float() * ratio).round().long()
-            pred_z0 = model(latent, t_scaled)
+            with torch.cuda.amp.autocast():
+                pred_z0 = model(latent, t_scaled)
             latent[:, 4:] = pred_z0  # 이미지 latent는 그대로 유지
 
         pred_depth_latent = latent[:, 4:]  # (B, 4, h, w)
@@ -1687,7 +1823,8 @@ def eval_on_nyu_test_set(model, vae, alphas_cumprod, device, output_dir="NYU v2 
 
         for ratio in [1.0, 0.66, 0.33, 0.0]:
             t_scaled = (t.float() * ratio).round().long()
-            pred_z0 = model(latent, t_scaled)
+            with torch.cuda.amp.autocast():
+                pred_z0 = model(latent, t_scaled)
             latent[:, 4:] = pred_z0
 
         pred_depth_latent = latent[:, 4:]
@@ -1868,6 +2005,12 @@ def main(rank, world_size):
         alphas_cumprod=alphas_cumprod,
         use_gradient_checkpointing=True,
     ).to(rank)
+    
+    # FP16 변환 (VAE는 수치적 안정성을 위해 FP32 유지)
+    if rank == 0:
+        print(f"[Rank {rank}] Converting model to FP16...")
+    model = model.half()  # 모델을 FP16으로 변환
+    # vae는 FP32로 유지 (수치적 안정성을 위해)
 
     # 5. 체크포인트 로드 ───────────────────────────────
     start_epoch, best_loss = 0, float("inf")
@@ -1901,6 +2044,9 @@ def main(rank, world_size):
         # (3) 메모리 정리
         del ckpt_cpu, state
         torch.cuda.empty_cache()
+        
+        # 체크포인트 로드 후 다시 FP16으로 변환
+        model = model.half()
     else:
         if rank == 0:
             print(f"[Rank {rank}] 체크포인트 없음. mode={mode}")
