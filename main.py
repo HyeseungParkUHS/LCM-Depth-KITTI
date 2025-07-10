@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler
 from huggingface_hub import login, whoami
+from torch.cuda.amp import autocast, GradScaler
 
 from models import (
     DepthEstimationUNet,
@@ -106,15 +107,15 @@ def train(
     # Base 모델 로드
     pipeline = StableDiffusionPipeline.from_pretrained(
         "stabilityai/stable-diffusion-2",
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,  # FP16 for memory efficiency
         use_safetensors=True
     )
 
     # VAE 설정 - pipeline의 VAE 직접 사용
-    vae = VAEWrapper(pipeline.vae).to(rank)
+    vae = VAEWrapper(pipeline.vae).to(rank).half()  # FP16
 
     # UNet 설정
-    unet = DepthEstimationUNet(pipeline.unet).to(rank)
+    unet = DepthEstimationUNet(pipeline.unet).to(rank).half()  # FP16
 
     # DDP 래핑
     unet = torch.nn.parallel.DistributedDataParallel(
@@ -271,15 +272,15 @@ def evaluate(
     # Base 모델 로드
     pipeline = StableDiffusionPipeline.from_pretrained(
         "stabilityai/stable-diffusion-2",
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,  # FP16 for memory efficiency
         use_safetensors=True
     )
 
     # VAE 설정
-    vae = VAEWrapper(pipeline.vae).to(rank)
+    vae = VAEWrapper(pipeline.vae).to(rank).half()  # FP16
 
     # UNet 설정
-    unet = DepthEstimationUNet(pipeline.unet).to(rank)
+    unet = DepthEstimationUNet(pipeline.unet).to(rank).half()  # FP16
 
     # DDP 래핑
     unet = torch.nn.parallel.DistributedDataParallel(
@@ -343,7 +344,7 @@ def evaluate(
     if rank == 0:
         pbar = tqdm(total=len(dataloader), desc="Evaluating")
 
-    with torch.no_grad():
+    with torch.no_grad(), autocast(dtype=torch.float16):
         for batch in dataloader:
             # 이미지를 디바이스로 이동
             rgb = batch['rgb'].to(rank)
