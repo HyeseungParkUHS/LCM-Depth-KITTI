@@ -284,7 +284,7 @@ class HyperSimDataset(Dataset):
 #       root/
 #         ├─ img/    frame_000001.png …
 #         └─ depth/  frame_000001.exr …
-#     * 깊이: EXR float32(m) 1‑채널 (‘Z’ 또는 ‘R’)
+#     * 깊이: EXR float32(m) 1‑채널 (‘Z' 또는 'R')
 #     * 출력: dict(rgb, depth, tag, rgb_path, depth_path)
 #             - rgb:   Tensor (3,H,W)  float32, 0‑1, ImageNet norm
 #             - depth: Tensor (1,H,W)  float32, [m]
@@ -315,7 +315,7 @@ class HyperSimDataset(Dataset):
 #         W = header['dataWindow'].max.x + 1
 #         H = header['dataWindow'].max.y + 1
 #
-#         # Synscapes EXR 는 'R' 채널 하나만 포함
+#         # Synscapes EXR 는 'R' 채널 하나만 포함
 #         channel_name = 'R' if 'R' in header['channels'] else 'Z'
 #         pt_float = Imath.PixelType(Imath.PixelType.FLOAT)
 #         depth_str = exr.channel(channel_name, pt_float)
@@ -605,9 +605,10 @@ def modify_unet_input_channels(unet, original_channels=4, target_channels=8):
 
 def load_pipeline(rank):
     # Stable Diffusion v1.5 or v2
+    # 🟢 Load weights directly in fp16 to save VRAM
     pipe = StableDiffusionPipeline.from_pretrained(
         "stabilityai/stable-diffusion-2",
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,
         use_safetensors=True,
     ).to(rank)
 
@@ -1396,7 +1397,8 @@ def train_lcm_one_epoch(
         T = alphas_cumprod.shape[0]
         t = torch.randint(0, T, (B,), device=device).long()
 
-        with autocast():
+        # 자동 mixed-precision (fp16) 연산
+        with autocast(dtype=torch.float16):
             image_latent = vae.encode(rgb).latent_dist.sample() * 0.18215
             depth_latent = vae.encode(depth.repeat(1, 3, 1, 1)).latent_dist.sample() * 0.18215
             noise = torch.randn_like(depth_latent)  # ✅ depth_latent랑 같은 shape으로 noise 생성
@@ -1414,11 +1416,20 @@ def train_lcm_one_epoch(
                     alphas_cumprod=alphas_cumprod,
                 ) / accumulation_steps
 
-                scaler.scale(loss).backward()
+                # NaN/Inf guard – skip backward if loss is not finite
+                if torch.isfinite(loss).all():
+                    scaler.scale(loss).backward()
+                else:
+                    print(f"[Rank {dist.get_rank()}] ⚠️  Non-finite loss at batch {batch_idx}. Skipping update.")
+                    continue
 
         total_loss += loss.item()
 
         if (batch_idx + 1) % accumulation_steps == 0:
+            # unscale before clipping to keep fp16 safe
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -1466,7 +1477,7 @@ def expand_unet_input_channels(unet, new_in_channels=8):
     # 기존 입력 Conv 레이어 가져오기
     old_conv = unet.conv_in
 
-    # 기존 conv의 설정 복제
+    # 기존 conv의 설정 복제 (dtype 동일 유지해 fp16 일관성)
     new_conv = nn.Conv2d(
         in_channels=new_in_channels,
         out_channels=old_conv.out_channels,
@@ -1474,7 +1485,7 @@ def expand_unet_input_channels(unet, new_in_channels=8):
         stride=old_conv.stride,
         padding=old_conv.padding,
         bias=old_conv.bias is not None,
-    )
+    ).to(dtype=old_conv.weight.dtype, device=old_conv.weight.device)
 
     # 기존 4채널 가중치를 8채널로 복사
     with torch.no_grad():
@@ -1612,7 +1623,7 @@ def eval_on_kitti_test_list(model, vae, alphas_cumprod, device, output_dir="KITT
         pred_np = pred_m[0, 0].cpu().numpy()  # (H, W), 단위=m
 
         # 2) 컬러맵용 선형 정규화 (0m=빨강, 80m=보라) -----------------
-        #    percentile→선형 치환으로 ‘매번 스케일 바뀌는 문제’ 제거
+        #    percentile→선형 치환으로 '매번 스케일 바뀌는 문제' 제거
         pred_norm = np.clip(pred_np / MAX_DEPTH, 0, 1)  # 0~1
         pred_color = plt.get_cmap("turbo")(1.0 - pred_norm)[..., :3]  # 가까울수록 빨강
         pred_color = (pred_color * 255).astype(np.uint8)
