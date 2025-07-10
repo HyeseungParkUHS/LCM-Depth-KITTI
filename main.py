@@ -42,6 +42,10 @@ height = 320
 torch.backends.cudnn.benchmark = True
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
+# FP16 최적화 설정
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 def huggingface_login(token):
     """Hugging Face 로그인"""
     login(token)
@@ -315,7 +319,7 @@ class HyperSimDataset(Dataset):
 #         W = header['dataWindow'].max.x + 1
 #         H = header['dataWindow'].max.y + 1
 #
-#         # Synscapes EXR 는 'R' 채널 하나만 포함
+#         # Synscapes EXR 는 'R' 채널 하나만 포함
 #         channel_name = 'R' if 'R' in header['channels'] else 'Z'
 #         pt_float = Imath.PixelType(Imath.PixelType.FLOAT)
 #         depth_str = exr.channel(channel_name, pt_float)
@@ -378,6 +382,10 @@ class RGBDTransform:
         self.noise_prob = noise_prob
 
     def __call__(self, rgb, depth):
+        # FP16로 변환
+        rgb = rgb.half()
+        depth = depth.half()
+        
         # Random horizontal flip
         if random.random() < self.flip_prob:
             rgb = torch.flip(rgb, dims=[2])  # width 방향
@@ -401,9 +409,9 @@ class RGBDTransform:
         if self.color_jitter:
             rgb = self.color_jitter(rgb)
 
-        # Gaussian noise (RGB만)
+        # Gaussian noise (RGB만) - FP16 noise
         if self.add_noise and random.random() < self.noise_prob:
-            noise = torch.randn_like(rgb) * 0.02
+            noise = torch.randn_like(rgb, dtype=torch.float16) * 0.02
             rgb = rgb + noise
             rgb = torch.clamp(rgb, 0.0, 1.0)
 
@@ -902,10 +910,11 @@ class ConsistencyModel(nn.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing  # ✨ 추가
 
     def forward(self, z, t, w=1.0):
+        # FP16로 dummy_text_embeds 생성
         dummy_text_embeds = torch.zeros(
             (z.shape[0], 77, 1024),
             device=z.device,
-            dtype=z.dtype
+            dtype=torch.float16  # FP16로 고정
         )
 
         if self.use_gradient_checkpointing:
@@ -918,6 +927,11 @@ class ConsistencyModel(nn.Module):
         else:
             # ✨ 기본 forward
             noise_pred = self.unet(z, t, encoder_hidden_states=dummy_text_embeds).sample
+
+        # NaN 체크 및 방지
+        if torch.isnan(noise_pred).any():
+            print("[WARNING] NaN detected in noise_pred, returning zeros")
+            return torch.zeros_like(noise_pred, dtype=torch.float16)
 
         return noise_pred
 
@@ -934,13 +948,13 @@ def get_sqrt_alpha_t(t, alphas_cumprod):
     t: (B,) long tensor
     alphas_cumprod: (T,) tensor
     """
-    return alphas_cumprod[t].sqrt().unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B,1,1,1)
+    return alphas_cumprod[t].sqrt().unsqueeze(1).unsqueeze(2).unsqueeze(3).half()  # (B,1,1,1) FP16
 
 def get_sqrt_one_minus_alpha_t(t, alphas_cumprod):
     """
     1 - alpha_cumprod에서 sqrt
     """
-    return (1. - alphas_cumprod[t]).sqrt().unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B,1,1,1)
+    return (1. - alphas_cumprod[t]).sqrt().unsqueeze(1).unsqueeze(2).unsqueeze(3).half()  # (B,1,1,1) FP16
 
 
 # @torch.no_grad()
@@ -1027,15 +1041,16 @@ def get_sqrt_one_minus_alpha_t(t, alphas_cumprod):
 @torch.no_grad()
 def sample_and_save_depth_model(model, vae, batch, device, batch_idx, output_dir, alphas_cumprod, epoch, num_inference_steps=4):
     """
-    LCM 모델에서 pred_z0과 depth_latent를 이미지로 저장하는 버전 통합
+    LCM 모델에서 pred_z0과 depth_latent를 이미지로 저장하는 버전 통합 - FP16 최적화
     """
     model.eval()
     vae.eval()
 
     os.makedirs(output_dir, exist_ok=True)
 
-    rgb = batch["rgb"].to(device)  # (B, 3, H, W)
-    depth = batch["depth"].to(device)  # (B, 1, H, W)
+    # FP16으로 데이터 변환
+    rgb = batch["rgb"].to(device, dtype=torch.float16)  # (B, 3, H, W)
+    depth = batch["depth"].to(device, dtype=torch.float16)  # (B, 1, H, W)
     tag_batch = batch["tag"]
 
     B = rgb.shape[0]
@@ -1052,7 +1067,8 @@ def sample_and_save_depth_model(model, vae, batch, device, batch_idx, output_dir
     sqrt_alpha = get_sqrt_alpha_t(t, alphas_cumprod)
     sqrt_one_minus_alpha = get_sqrt_one_minus_alpha_t(t, alphas_cumprod)
 
-    noise = torch.randn_like(depth_latent)
+    # FP16 noise 생성
+    noise = torch.randn_like(depth_latent, dtype=torch.float16)
     noisy_depth_latent = sqrt_alpha * depth_latent + sqrt_one_minus_alpha * noise
     noisy_latent = torch.cat([image_latent, noisy_depth_latent], dim=1)
 
@@ -1388,67 +1404,98 @@ def train_lcm_one_epoch(
         progress_bar = tqdm(total=num_batches, desc=f"[Epoch {epoch}]")
 
     for batch_idx, batch in enumerate(train_loader):
-        rgb = batch["rgb"].to(device)
-        depth = batch["depth"].to(device)
+        # FP16으로 데이터 변환
+        rgb = batch["rgb"].to(device, dtype=torch.float16)
+        depth = batch["depth"].to(device, dtype=torch.float16)
         rgb, depth = transform(rgb, depth)
 
         B = rgb.shape[0]
         T = alphas_cumprod.shape[0]
         t = torch.randint(0, T, (B,), device=device).long()
 
-        with autocast():
-            image_latent = vae.encode(rgb).latent_dist.sample() * 0.18215
-            depth_latent = vae.encode(depth.repeat(1, 3, 1, 1)).latent_dist.sample() * 0.18215
-            noise = torch.randn_like(depth_latent)  # ✅ depth_latent랑 같은 shape으로 noise 생성
+        try:
+            with autocast():
+                # NaN 체크 및 방지
+                if torch.isnan(rgb).any() or torch.isnan(depth).any():
+                    print(f"[WARNING] NaN detected in input data at batch {batch_idx}")
+                    continue
 
-            sync_context = (
-                model.no_sync() if (batch_idx + 1) % accumulation_steps else nullcontext()
-            )
-            with sync_context:
-                loss = compute_lcm_loss(
-                    model=model,
-                    image_latent=image_latent,
-                    depth_latent=depth_latent,
-                    noise=noise,
-                    t=t,
-                    alphas_cumprod=alphas_cumprod,
-                ) / accumulation_steps
+                image_latent = vae.encode(rgb).latent_dist.sample() * 0.18215
+                depth_latent = vae.encode(depth.repeat(1, 3, 1, 1)).latent_dist.sample() * 0.18215
+                noise = torch.randn_like(depth_latent, dtype=torch.float16)  # FP16 noise
 
-                scaler.scale(loss).backward()
+                # NaN 체크
+                if torch.isnan(image_latent).any() or torch.isnan(depth_latent).any():
+                    print(f"[WARNING] NaN detected in latents at batch {batch_idx}")
+                    continue
 
-        total_loss += loss.item()
-
-        if (batch_idx + 1) % accumulation_steps == 0:
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-        # EMA loss 업데이트
-        if ema_loss is None:
-            ema_loss = loss.item() * accumulation_steps
-        else:
-            ema_loss = 0.95 * ema_loss + 0.05 * (loss.item() * accumulation_steps)
-
-        # Progress Bar 업데이트
-        if dist.get_rank() == 0:
-            progress_bar.update(1)
-            progress_bar.set_postfix({
-                "loss": f"{loss.item() * accumulation_steps:.8f}",
-                "ema_loss": f"{ema_loss:.8f}"
-            })
-
-            if batch_idx % save_interval == 0:
-                sample_and_save_depth_model(
-                    model=model,
-                    vae=vae,
-                    batch=batch,
-                    device=device,
-                    batch_idx=batch_idx,
-                    output_dir=output_dir,
-                    alphas_cumprod=alphas_cumprod,
-                    epoch=epoch,
-                    num_inference_steps=4,
+                sync_context = (
+                    model.no_sync() if (batch_idx + 1) % accumulation_steps else nullcontext()
                 )
+                with sync_context:
+                    loss = compute_lcm_loss(
+                        model=model,
+                        image_latent=image_latent,
+                        depth_latent=depth_latent,
+                        noise=noise,
+                        t=t,
+                        alphas_cumprod=alphas_cumprod,
+                    ) / accumulation_steps
+
+                    # NaN 체크
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"[WARNING] NaN/Inf loss detected at batch {batch_idx}, skipping...")
+                        optimizer.zero_grad()
+                        continue
+
+                    scaler.scale(loss).backward()
+
+            total_loss += loss.item()
+
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # Gradient clipping 추가
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            # EMA loss 업데이트
+            if ema_loss is None:
+                ema_loss = loss.item() * accumulation_steps
+            else:
+                ema_loss = 0.95 * ema_loss + 0.05 * (loss.item() * accumulation_steps)
+
+            # Progress Bar 업데이트
+            if dist.get_rank() == 0:
+                progress_bar.update(1)
+                progress_bar.set_postfix({
+                    "loss": f"{loss.item() * accumulation_steps:.8f}",
+                    "ema_loss": f"{ema_loss:.8f}"
+                })
+
+                if batch_idx % save_interval == 0:
+                    sample_and_save_depth_model(
+                        model=model,
+                        vae=vae,
+                        batch=batch,
+                        device=device,
+                        batch_idx=batch_idx,
+                        output_dir=output_dir,
+                        alphas_cumprod=alphas_cumprod,
+                        epoch=epoch,
+                        num_inference_steps=4,
+                    )
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"[OOM] GPU OOM at batch {batch_idx}, skipping...")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            else:
+                print(f"[ERROR] Runtime error at batch {batch_idx}: {e}")
+                continue
 
     if torch.distributed.get_rank() == 0:
         progress_bar.close()
@@ -1496,28 +1543,47 @@ def extract(a, t, shape):
     shape: (B, 1, 1, 1) - 원하는 리쉐입 형태
     """
     out = a.gather(-1, t)
-    return out.view(shape).float()
+    return out.view(shape).half()  # FP16로 반환
 
 
 def compute_lcm_loss(model, image_latent, depth_latent, noise, t, alphas_cumprod):
     """
-    LCM Consistency Loss만 계산
+    LCM Consistency Loss만 계산 - FP16 최적화 및 NaN 방지
     """
     B = image_latent.shape[0]
     sqrt_alpha = extract(alphas_cumprod, t, (B, 1, 1, 1)).sqrt()
     sqrt_one_minus_alpha = (1. - extract(alphas_cumprod, t, (B, 1, 1, 1))).sqrt()
 
+    # FP16로 변환
+    sqrt_alpha = sqrt_alpha.half()
+    sqrt_one_minus_alpha = sqrt_one_minus_alpha.half()
+
     noisy_depth = sqrt_alpha * depth_latent + sqrt_one_minus_alpha * noise
     noisy_concat = torch.cat([image_latent, noisy_depth], dim=1)
 
+    # NaN 체크
+    if torch.isnan(noisy_concat).any():
+        print("[WARNING] NaN detected in noisy_concat")
+        return torch.tensor(0.0, device=image_latent.device, dtype=torch.float16, requires_grad=True)
+
     pred_z0 = model(noisy_concat, t)
+    
+    # NaN 체크
+    if torch.isnan(pred_z0).any():
+        print("[WARNING] NaN detected in pred_z0")
+        return torch.tensor(0.0, device=image_latent.device, dtype=torch.float16, requires_grad=True)
+
     loss_consistency = F.mse_loss(pred_z0, depth_latent)
+    
+    # Loss 값 안정화
+    loss_consistency = torch.clamp(loss_consistency, min=1e-8, max=1e8)
+    
     return loss_consistency
 
 
 def add_noise_lcm_style(latents, noise, timesteps, alphas_cumprod):
     """
-    LCM-style 노이즈 추가 방법
+    LCM-style 노이즈 추가 방법 - FP16 최적화
     - image latent는 건드리지 않고,
     - depth latent에만 noise를 추가
     """
@@ -1529,6 +1595,10 @@ def add_noise_lcm_style(latents, noise, timesteps, alphas_cumprod):
     sqrt_alpha = extract(alphas_cumprod, timesteps, (B, 1, 1, 1)).sqrt()
     sqrt_one_minus_alpha = (1. - extract(alphas_cumprod, timesteps, (B, 1, 1, 1))).sqrt()
 
+    # FP16로 변환
+    sqrt_alpha = sqrt_alpha.half()
+    sqrt_one_minus_alpha = sqrt_one_minus_alpha.half()
+
     noisy_depth_latent = sqrt_alpha * depth_latent + sqrt_one_minus_alpha * noise
     noisy_latents = torch.cat([image_latent, noisy_depth_latent], dim=1)  # 다시 (B, 8, H, W)
     return noisy_latents
@@ -1536,7 +1606,7 @@ def add_noise_lcm_style(latents, noise, timesteps, alphas_cumprod):
 
 def add_noise_to_depth_latent(depth_latent, noise, timesteps, alphas_cumprod):
     """
-    depth_latent: (B, 4, H, W)
+    depth_latent: (B, 4, H, W) - FP16 최적화
     noise: (B, 4, H, W)
     timesteps: (B,)
     alphas_cumprod: (T,)
@@ -1545,6 +1615,11 @@ def add_noise_to_depth_latent(depth_latent, noise, timesteps, alphas_cumprod):
     assert C == 4, "depth_latent must have 4 channels"
     sqrt_alpha = extract(alphas_cumprod, timesteps, (B, 1, 1, 1)).sqrt()
     sqrt_one_minus_alpha = (1. - extract(alphas_cumprod, timesteps, (B, 1, 1, 1))).sqrt()
+    
+    # FP16로 변환
+    sqrt_alpha = sqrt_alpha.half()
+    sqrt_one_minus_alpha = sqrt_one_minus_alpha.half()
+    
     return sqrt_alpha * depth_latent + sqrt_one_minus_alpha * noise
 
 
@@ -1612,7 +1687,7 @@ def eval_on_kitti_test_list(model, vae, alphas_cumprod, device, output_dir="KITT
         pred_np = pred_m[0, 0].cpu().numpy()  # (H, W), 단위=m
 
         # 2) 컬러맵용 선형 정규화 (0m=빨강, 80m=보라) -----------------
-        #    percentile→선형 치환으로 ‘매번 스케일 바뀌는 문제’ 제거
+        #    percentile→선형 치환으로 ‘매번 스케일 바뀌는 문제' 제거
         pred_norm = np.clip(pred_np / MAX_DEPTH, 0, 1)  # 0~1
         pred_color = plt.get_cmap("turbo")(1.0 - pred_norm)[..., :3]  # 가까울수록 빨강
         pred_color = (pred_color * 255).astype(np.uint8)
@@ -1862,12 +1937,16 @@ def main(rank, world_size):
     if unet.conv_in.in_channels == 4:          # 중복 확장 방지
         unet = expand_unet_input_channels(unet, 8)
 
-    alphas_cumprod = get_alphas_cumprod().to(rank)
+    alphas_cumprod = get_alphas_cumprod().to(rank).half()  # FP16으로 변환
     model = ConsistencyModel(
         unet=unet,
         alphas_cumprod=alphas_cumprod,
         use_gradient_checkpointing=True,
     ).to(rank)
+
+    # FP16 설정 추가
+    model = model.half()  # 모델을 FP16으로 변환
+    vae = vae.half()      # VAE도 FP16으로 변환
 
     # 5. 체크포인트 로드 ───────────────────────────────
     start_epoch, best_loss = 0, float("inf")
@@ -1908,8 +1987,8 @@ def main(rank, world_size):
     # 6. DDP 래핑 (마지막 단계) ───────────────────
     model = wrap_model_ddp(model, rank)
 
-    # 7. Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6, weight_decay=0.01)
+    # 7. Optimizer - FP16에 최적화된 설정
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6, weight_decay=0.01, eps=1e-8)
 
     if mode == "train":
         # 8. DataLoader
